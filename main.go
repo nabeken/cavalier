@@ -214,6 +214,8 @@ func (c *Cavalier) deleteDBInstance(ctx context.Context, dbInstanceIdentifier st
 
 	log.Printf("Waiting for the DB instance to be deleted...")
 
+	time.Sleep(10 * time.Second)
+
 	waiter := rds.NewDBInstanceDeletedWaiter(c.rdsc.RDS, dbInstanceDeletedWaiterOption)
 
 	if err := waiter.Wait(
@@ -251,7 +253,7 @@ func (c *Cavalier) handleTerminate(ctx context.Context) error {
 		log.Printf("Terminating the DB instance '%s'...", c.opts.DBInstanceIdentifier)
 
 		if err := c.deleteDBInstance(ctx, c.opts.DBInstanceIdentifier); err != nil {
-			return nil
+			return err
 		}
 
 		log.Printf("The DB instance '%s' has been terminated", c.opts.DBInstanceIdentifier)
@@ -561,13 +563,15 @@ func dbInstanceDeletedWaiterOption(opts *rds.DBInstanceDeletedWaiterOptions) {
 		err error,
 	) (bool, error) {
 		ok, err := waiterRetryable(ctx, input, output, err)
-		if !ok {
-			return false, err
+		if !errors.Is(err, errSkipRetrable) {
+			return ok, err
 		}
 
 		return origRetryable(ctx, input, output, err)
 	}
 }
+
+var errSkipRetrable = errors.New("cavalier: skip retryable")
 
 func waiterRetryable(
 	ctx context.Context,
@@ -575,20 +579,20 @@ func waiterRetryable(
 	_ *rds.DescribeDBInstancesOutput,
 	err error,
 ) (bool, error) {
+	// return true if no decision will be made here
 	if err == nil {
-		return true, nil
+		return false, errSkipRetrable
 	}
 
 	var apiErr smithy.APIError
 	ok := errors.As(err, &apiErr)
 	if !ok {
-		return false, fmt.Errorf("expected err to be of type smithy.APIError, got %w", err)
+		return false, errSkipRetrable
 	}
 
 	if apiErr.ErrorCode() == "ExpiredToken" {
 		return false, err
 	}
 
-	// no decision made here
-	return true, nil
+	return false, errSkipRetrable
 }
