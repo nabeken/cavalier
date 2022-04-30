@@ -2,33 +2,27 @@ package main
 
 import (
 	"context"
-	"flag"
 	"fmt"
 	"log"
-	"os"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/rds"
+	"github.com/spf13/cobra"
 )
 
-type stringListOpt []string
-
-func (o stringListOpt) String() string {
-	return fmt.Sprint("%v", ([]string)(o))
-}
-
-func (o *stringListOpt) Set(v string) error {
-	*o = append(*o, v)
-	return nil
-}
-
 type opts struct {
-	DBInstanceClass     string
-	SnapshotARN         string
-	DBSubnetGroupName   string
-	VPCSecurityGroupIDs stringListOpt
+	SnapshotARN string
+
+	DBInstanceClass      string
+	DBSubnetGroupName    string
+	DBInstanceIdentifier string
+	DBParameterGroupName string
+
+	OptionGroupName string
+
+	VPCSecurityGroupIDs []string
 }
 
 type RDSClient struct {
@@ -36,14 +30,12 @@ type RDSClient struct {
 }
 
 func main() {
-	if err := realmain(os.Args); err != nil {
+	if err := realmain(); err != nil {
 		log.Fatal(err)
 	}
 }
 
-func realmain(args []string) error {
-	fmt.Println("Hello, cavalier")
-
+func realmain() error {
 	ctx := context.Background()
 
 	cfg, err := config.LoadDefaultConfig(ctx)
@@ -51,45 +43,76 @@ func realmain(args []string) error {
 		return fmt.Errorf("loading SDK config, %w", err)
 	}
 
-	opts := &opts{}
-
-	f := flag.NewFlagSet(args[0], flag.ExitOnError)
-	f.StringVar(&opts.SnapshotARN, "snapshot-arn", "", "specify an ARN of the snapshot to restore")
-	f.StringVar(&opts.DBSubnetGroupName, "db-subnet-group-name", "", "specify a DB subnet group name")
-	f.StringVar(&opts.DBInstanceClass, "db-instance-class", "db.t3.medium", "specify a DB instance class")
-	f.Var(&opts.VPCSecurityGroupIDs, "vpc-security-group-id", "specify a security group id")
-
-	if err := f.Parse(args[1:]); err != nil {
-		return err
+	cv := &Cavalier{
+		rdsc: &RDSClient{RDS: rds.NewFromConfig(cfg)},
 	}
 
-	if opts.SnapshotARN == "" {
-		return fmt.Errorf("no snapshot-arn is specified")
-	}
-	if opts.DBSubnetGroupName == "" {
-		return fmt.Errorf("no db-subnet-group-name is specified")
-	}
-	if len(opts.VPCSecurityGroupIDs) == 0 {
-		return fmt.Errorf("no vpc-security-group-id is specified")
+	rootCmd := &cobra.Command{
+		Use:   "cavalier",
+		Short: "cavalier is a ommand-line tool to help database testing with snapshots taken by Amazon RDS",
+		Run: func(cmd *cobra.Command, args []string) {
+			fmt.Println("please specify a subcommand")
+		},
 	}
 
-	rdsc := &RDSClient{RDS: rds.NewFromConfig(cfg)}
+	restoreCmd := restoreCmdFlags(cv, &cobra.Command{
+		Use:   "restore",
+		Short: "Restore a DB instance from a given DB Snapshot",
+		Run: func(cmd *cobra.Command, args []string) {
+			if err := cv.handleRestore(ctx); err != nil {
+				log.Fatalf("Failed to restore the DB instance: %s", err)
+			}
+		},
+	})
 
-	log.Printf("Restoring a DB Instance from '%s'...", opts.SnapshotARN)
+	rootCmd.AddCommand(restoreCmd)
 
-	resp, err := rdsc.RDS.RestoreDBInstanceFromDBSnapshot(
+	return rootCmd.Execute()
+}
+
+func restoreCmdFlags(cv *Cavalier, c *cobra.Command) *cobra.Command {
+	o := &cv.opts
+
+	// optional
+	c.Flags().StringVar(&o.DBInstanceClass, "db-instance-class", "db.t3.medium", "DB instance class")
+	c.Flags().StringVar(&o.DBParameterGroupName, "db-parameter-group", "", "DB parameter group")
+	c.Flags().StringVar(&o.OptionGroupName, "option-group", "", "option group name")
+
+	// required
+	c.Flags().StringVar(&o.SnapshotARN, "snapshot-arn", "", "snapshot ARN to restore (required)")
+	c.MarkFlagRequired("snapshot-arn")
+
+	c.Flags().StringVar(&o.DBSubnetGroupName, "db-subnet-group", "", "DB subnet group (required)")
+	c.MarkFlagRequired("db-subnet-group")
+
+	c.Flags().StringVar(&o.DBInstanceIdentifier, "db-instance-identifier", "", "DB instance identifier (required)")
+	c.MarkFlagRequired("db-instance-identifier")
+
+	c.Flags().StringSliceVar(&o.VPCSecurityGroupIDs, "vpc-security-groups", nil, "comma-separated VPC Security Group IDs (required)")
+	c.MarkFlagRequired("vpc-security-groups")
+
+	return c
+}
+
+type Cavalier struct {
+	opts opts
+	rdsc *RDSClient
+}
+
+func (c *Cavalier) handleRestore(ctx context.Context) error {
+	log.Printf("Restoring a DB Instance from '%s'...", c.opts.SnapshotARN)
+
+	resp, err := c.rdsc.RDS.RestoreDBInstanceFromDBSnapshot(
 		ctx,
 		&rds.RestoreDBInstanceFromDBSnapshotInput{
-			DBSnapshotIdentifier: aws.String(opts.SnapshotARN),
-			DBSubnetGroupName:    aws.String(opts.DBSubnetGroupName),
-			VpcSecurityGroupIds:  opts.VPCSecurityGroupIDs,
-			DBInstanceClass:      aws.String(opts.DBInstanceClass),
+			DBSnapshotIdentifier: aws.String(c.opts.SnapshotARN),
+			DBSubnetGroupName:    aws.String(c.opts.DBSubnetGroupName),
+			VpcSecurityGroupIds:  c.opts.VPCSecurityGroupIDs,
+			DBInstanceClass:      aws.String(c.opts.DBInstanceClass),
+			DBInstanceIdentifier: aws.String(c.opts.DBInstanceIdentifier),
 
-			// FIXME:
-			DBInstanceIdentifier: aws.String("test"),
-
-			//DBParameterGroupName
-			//OptionGroupName
+			DBParameterGroupName: stringOrNil(c.opts.DBParameterGroupName),
+			OptionGroupName:      stringOrNil(c.opts.OptionGroupName),
 
 			EnableIAMDatabaseAuthentication: aws.Bool(true),
 			PubliclyAccessible:              aws.Bool(false),
@@ -103,7 +126,7 @@ func realmain(args []string) error {
 
 	log.Println("Waiting for the DB Instance to be up and running...")
 
-	waiter := rds.NewDBInstanceAvailableWaiter(rdsc.RDS)
+	waiter := rds.NewDBInstanceAvailableWaiter(c.rdsc.RDS)
 	if err := waiter.Wait(
 		ctx,
 		&rds.DescribeDBInstancesInput{
@@ -119,4 +142,11 @@ func realmain(args []string) error {
 	log.Printf("DB Instance: %v\n", resp.DBInstance)
 
 	return nil
+}
+
+func stringOrNil(v string) *string {
+	if v == "" {
+		return nil
+	}
+	return aws.String(v)
 }
