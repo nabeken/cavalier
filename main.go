@@ -14,6 +14,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/rds/types"
 	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
 	smtypes "github.com/aws/aws-sdk-go-v2/service/secretsmanager/types"
+	"github.com/aws/smithy-go"
 	"github.com/sethvargo/go-password/password"
 	"github.com/spf13/cobra"
 )
@@ -184,40 +185,41 @@ type DBInstance struct {
 	MasterUserPassword string
 }
 
-func (c *Cavalier) handleTerminate(ctx context.Context) error {
-	// refuse to terminate if the instance wasn't created by the cavalier
-	dbi, ok, err := c.isCreatedByCavalier(ctx)
-	if err != nil {
-		return err
-	}
+func IsDBDeleted(err error) bool {
+	var notFoundErr *types.DBInstanceNotFoundFault
+	return errors.As(err, &notFoundErr)
+}
 
-	if !ok {
-		return errors.New("the specified DB instance wasn't created by the cavalier")
-	}
-
-	log.Printf("Terminating the DB instance '%s'...", c.opts.DBInstanceIdentifier)
-
-	if _, err = c.rdsc.RDS.DeleteDBInstance(ctx, &rds.DeleteDBInstanceInput{
-		DBInstanceIdentifier:   dbi.DBInstanceIdentifier,
+func (c *Cavalier) deleteDBInstance(ctx context.Context, dbInstanceIdentifier string) error {
+	_, err := c.rdsc.RDS.DeleteDBInstance(ctx, &rds.DeleteDBInstanceInput{
+		DBInstanceIdentifier:   aws.String(dbInstanceIdentifier),
 		DeleteAutomatedBackups: aws.Bool(true),
 		SkipFinalSnapshot:      true,
-	}); err != nil {
-		var dberr *types.InvalidDBInstanceStateFault
-		if !errors.As(err, &dberr) {
-			return fmt.Errorf("deleting the DB instance: %w", err)
-		}
+	})
 
-		log.Printf("The DB instance is being deleted...")
+	if err == nil {
+		return nil
 	}
 
-	waiter := rds.NewDBInstanceDeletedWaiter(c.rdsc.RDS)
+	var notFoundErr *types.DBInstanceNotFoundFault
+	if errors.As(err, &notFoundErr) {
+		log.Printf("The DB instance is already deleted.")
+		return nil
+	}
+
+	var invalidStateErr *types.InvalidDBInstanceStateFault
+	if !errors.As(err, &invalidStateErr) {
+		return fmt.Errorf("deleting the DB instance: %w", err)
+	}
 
 	log.Printf("Waiting for the DB instance to be deleted...")
+
+	waiter := rds.NewDBInstanceDeletedWaiter(c.rdsc.RDS, dbInstanceDeletedWaiterOption)
 
 	if err := waiter.Wait(
 		ctx,
 		&rds.DescribeDBInstancesInput{
-			DBInstanceIdentifier: dbi.DBInstanceIdentifier,
+			DBInstanceIdentifier: aws.String(dbInstanceIdentifier),
 		},
 
 		30*time.Minute, // should be long enough
@@ -225,10 +227,38 @@ func (c *Cavalier) handleTerminate(ctx context.Context) error {
 		return fmt.Errorf("waiting for the instance to be deleted: %w", err)
 	}
 
-	log.Printf("The DB instance '%s' has been terminated", *dbi.DBInstanceIdentifier)
+	return nil
+}
+
+func (c *Cavalier) handleTerminate(ctx context.Context) error {
+	var dbAlreadyDeleted bool
+
+	// refuse to terminate if the instance wasn't created by the cavalier
+	_, ok, err := c.isCreatedByCavalier(ctx)
+	if err != nil {
+		if IsDBDeleted(err) {
+			dbAlreadyDeleted = true
+		} else {
+			return err
+		}
+	}
+
+	if !dbAlreadyDeleted && !ok {
+		return errors.New("the specified DB instance wasn't created by the cavalier")
+	}
+
+	if !dbAlreadyDeleted {
+		log.Printf("Terminating the DB instance '%s'...", c.opts.DBInstanceIdentifier)
+
+		if err := c.deleteDBInstance(ctx, c.opts.DBInstanceIdentifier); err != nil {
+			return nil
+		}
+
+		log.Printf("The DB instance '%s' has been terminated", c.opts.DBInstanceIdentifier)
+	}
 
 	// removing the secret for the DB instance
-	if err := c.deleteMasterUserPasswordSecret(ctx, *dbi.DBInstanceIdentifier); err != nil {
+	if err := c.deleteMasterUserPasswordSecret(ctx, c.opts.DBInstanceIdentifier); err != nil {
 		return err
 	}
 
@@ -325,7 +355,7 @@ func (c *Cavalier) handleRestore(ctx context.Context) error {
 }
 
 func (c *Cavalier) checkWhetherDBInstanceAvailable(ctx context.Context, dbID *string) error {
-	waiter := rds.NewDBInstanceAvailableWaiter(c.rdsc.RDS)
+	waiter := rds.NewDBInstanceAvailableWaiter(c.rdsc.RDS, dbInstanceAvailableWaiterOption)
 	if err := waiter.Wait(
 		ctx,
 		&rds.DescribeDBInstancesInput{
@@ -497,4 +527,68 @@ func generateMasterUserPassword() (string, error) {
 
 func masterUserPasswordSecretName(prefix, name string) string {
 	return fmt.Sprintf("%s/%s", prefix, name)
+}
+
+func dbInstanceAvailableWaiterOption(opts *rds.DBInstanceAvailableWaiterOptions) {
+	opts.MinDelay = 30 * time.Second
+	opts.MaxDelay = opts.MaxDelay
+
+	origRetryable := opts.Retryable
+	opts.Retryable = func(
+		ctx context.Context,
+		input *rds.DescribeDBInstancesInput,
+		output *rds.DescribeDBInstancesOutput,
+		err error,
+	) (bool, error) {
+		ok, err := waiterRetryable(ctx, input, output, err)
+		if !ok {
+			return false, err
+		}
+
+		return origRetryable(ctx, input, output, err)
+	}
+}
+
+func dbInstanceDeletedWaiterOption(opts *rds.DBInstanceDeletedWaiterOptions) {
+	opts.MinDelay = 30 * time.Second
+	opts.MaxDelay = opts.MaxDelay
+
+	origRetryable := opts.Retryable
+	opts.Retryable = func(
+		ctx context.Context,
+		input *rds.DescribeDBInstancesInput,
+		output *rds.DescribeDBInstancesOutput,
+		err error,
+	) (bool, error) {
+		ok, err := waiterRetryable(ctx, input, output, err)
+		if !ok {
+			return false, err
+		}
+
+		return origRetryable(ctx, input, output, err)
+	}
+}
+
+func waiterRetryable(
+	ctx context.Context,
+	_ *rds.DescribeDBInstancesInput,
+	_ *rds.DescribeDBInstancesOutput,
+	err error,
+) (bool, error) {
+	if err == nil {
+		return true, nil
+	}
+
+	var apiErr smithy.APIError
+	ok := errors.As(err, &apiErr)
+	if !ok {
+		return false, fmt.Errorf("expected err to be of type smithy.APIError, got %w", err)
+	}
+
+	if apiErr.ErrorCode() == "ExpiredToken" {
+		return false, err
+	}
+
+	// no decision made here
+	return true, nil
 }
