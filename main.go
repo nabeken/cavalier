@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"strconv"
 	"time"
 
@@ -20,6 +21,8 @@ import (
 )
 
 type opts struct {
+	SourceDBInstanceIdentifier string
+
 	SnapshotARN string
 
 	DBInstanceClass      string
@@ -31,10 +34,36 @@ type opts struct {
 	SecretsManagerPrefix string
 
 	VPCSecurityGroupIDs []string
+
+	takeSnapshot bool
 }
 
 type RDSClient struct {
 	RDS *rds.Client
+}
+
+func (c *RDSClient) DescribeDBSnapshotByIdentifier(ctx context.Context, dbi string) (types.DBSnapshot, error) {
+	var zero types.DBSnapshot
+
+	p := rds.NewDescribeDBSnapshotsPaginator(c.RDS, &rds.DescribeDBSnapshotsInput{
+		DBSnapshotIdentifier: aws.String(dbSnapshotName(dbi)),
+		SnapshotType:         aws.String("manual"),
+	})
+
+	for p.HasMorePages() {
+		resp, err := p.NextPage(ctx)
+		if err != nil {
+			return zero, fmt.Errorf("describing the DB snapshot: %w", err)
+		}
+
+		for _, s := range resp.DBSnapshots {
+			if isSnapshotCreatedByCavalier(dbi, s) {
+				return s, nil
+			}
+		}
+	}
+
+	return zero, errors.New("no corresponding the DB snapshot")
 }
 
 type SecretsManagerClient struct {
@@ -64,13 +93,40 @@ func realmain() error {
 		Use:   "cavalier",
 		Short: "cavalier is a ommand-line tool to help database testing with snapshots taken by Amazon RDS",
 		Run: func(cmd *cobra.Command, args []string) {
-			fmt.Println("please specify a subcommand")
+			cmd.PrintErr("please specify a subcommand")
+		},
+	})
+
+	snapshotCmd := snapshotCmdFlags(cv, &cobra.Command{
+		Use:   "snapshot",
+		Short: "Take a DB snapshot of a running DB Snapshot",
+		Run: func(cmd *cobra.Command, args []string) {
+			if err := cv.handleSnapshot(ctx); err != nil {
+				log.Fatalf("Failed to take the DB snapshot: %s", err)
+			}
 		},
 	})
 
 	restoreCmd := restoreCmdFlags(cv, &cobra.Command{
 		Use:   "restore",
 		Short: "Restore a DB instance from a given DB Snapshot",
+
+		PreRun: func(cmd *cobra.Command, args []string) {
+			if cv.opts.SnapshotARN != "" && cv.opts.SourceDBInstanceIdentifier != "" {
+				cmd.PrintErr("--snapshot-arn and --source-db-instance-identifier can't be used together\n")
+				os.Exit(1)
+			}
+
+			if cv.opts.SnapshotARN == "" && cv.opts.SourceDBInstanceIdentifier == "" {
+				cmd.PrintErr("--snapshot-arn or --source-db-instance-identifier must be specified\n")
+				os.Exit(1)
+			}
+
+			if cv.opts.SourceDBInstanceIdentifier != "" {
+				cv.opts.takeSnapshot = true
+			}
+		},
+
 		Run: func(cmd *cobra.Command, args []string) {
 			if err := cv.handleRestore(ctx); err != nil {
 				log.Fatalf("Failed to restore the DB instance: %s", err)
@@ -101,6 +157,7 @@ func realmain() error {
 	rootCmd.AddCommand(restoreCmd)
 	rootCmd.AddCommand(terminateCmd)
 	rootCmd.AddCommand(modifyCmd)
+	rootCmd.AddCommand(snapshotCmd)
 
 	return rootCmd.Execute()
 }
@@ -125,6 +182,10 @@ func (fb *flagsBuilder) Build(name string) *flagsBuilder {
 		)
 
 		fb.cmd.MarkFlagRequired(name)
+	case "source-db-instance-identifier":
+		fb.cmd.Flags().StringVar(&o.SourceDBInstanceIdentifier,
+			name, "", "source DB instance identifier to take snapshot (required)",
+		)
 
 	default:
 		panic(fmt.Sprintf("unknown flag: %s", name))
@@ -134,15 +195,18 @@ func (fb *flagsBuilder) Build(name string) *flagsBuilder {
 }
 
 func rootCmdFlags(cv *Cavalier, c *cobra.Command) *cobra.Command {
-	(&flagsBuilder{cv, c}).Build("secrets-manager-prefix")
-
-	return c
+	return (&flagsBuilder{cv, c}).Build("secrets-manager-prefix").cmd
 }
 
 func terminateCmdFlags(cv *Cavalier, c *cobra.Command) *cobra.Command {
-	(&flagsBuilder{cv, c}).Build("db-instance-identifier")
+	return (&flagsBuilder{cv, c}).Build("db-instance-identifier").cmd
+}
 
-	return c
+func snapshotCmdFlags(cv *Cavalier, c *cobra.Command) *cobra.Command {
+	return (&flagsBuilder{cv, c}).
+		Build("db-instance-identifier").
+		Build("source-db-instance-identifier").
+		cmd
 }
 
 func restoreCmdFlags(cv *Cavalier, c *cobra.Command) *cobra.Command {
@@ -152,15 +216,14 @@ func restoreCmdFlags(cv *Cavalier, c *cobra.Command) *cobra.Command {
 	c.Flags().StringVar(&o.DBInstanceClass, "db-instance-class", "db.t3.medium", "DB instance class")
 	c.Flags().StringVar(&o.DBParameterGroupName, "db-parameter-group", "", "DB parameter group")
 	c.Flags().StringVar(&o.OptionGroupName, "option-group", "", "option group name")
-
-	// required
 	c.Flags().StringVar(&o.SnapshotARN, "snapshot-arn", "", "snapshot ARN to restore (required)")
-	c.MarkFlagRequired("snapshot-arn")
 
 	c.Flags().StringVar(&o.DBSubnetGroupName, "db-subnet-group", "", "DB subnet group (required)")
 	c.MarkFlagRequired("db-subnet-group")
 
-	(&flagsBuilder{cv, c}).Build("db-instance-identifier")
+	(&flagsBuilder{cv, c}).
+		Build("db-instance-identifier").
+		Build("source-db-instance-identifier")
 
 	c.Flags().StringSliceVar(&o.VPCSecurityGroupIDs, "vpc-security-groups", nil, "comma-separated VPC Security Group IDs (required)")
 	c.MarkFlagRequired("vpc-security-groups")
@@ -197,10 +260,6 @@ func (c *Cavalier) deleteDBInstance(ctx context.Context, dbInstanceIdentifier st
 		SkipFinalSnapshot:      true,
 	})
 
-	if err == nil {
-		return nil
-	}
-
 	var notFoundErr *types.DBInstanceNotFoundFault
 	if errors.As(err, &notFoundErr) {
 		log.Printf("The DB instance is already deleted.")
@@ -208,7 +267,7 @@ func (c *Cavalier) deleteDBInstance(ctx context.Context, dbInstanceIdentifier st
 	}
 
 	var invalidStateErr *types.InvalidDBInstanceStateFault
-	if !errors.As(err, &invalidStateErr) {
+	if err != nil && !errors.As(err, &invalidStateErr) {
 		return fmt.Errorf("deleting the DB instance: %w", err)
 	}
 
@@ -236,7 +295,7 @@ func (c *Cavalier) handleTerminate(ctx context.Context) error {
 	var dbAlreadyDeleted bool
 
 	// refuse to terminate if the instance wasn't created by the cavalier
-	_, ok, err := c.isCreatedByCavalier(ctx)
+	dbi, ok, err := c.isCreatedByCavalier(ctx)
 	if err != nil {
 		if IsDBDeleted(err) {
 			dbAlreadyDeleted = true
@@ -266,6 +325,26 @@ func (c *Cavalier) handleTerminate(ctx context.Context) error {
 
 	log.Print("The master user password for the DB instance has been deleted.")
 
+	// delete the corresponding snapshot if exists
+	dbs, err := c.rdsc.DescribeDBSnapshotByIdentifier(ctx, c.opts.DBInstanceIdentifier)
+	if err != nil {
+		return err
+	}
+
+	if doesUseSnapshotCreatedByCavalier(dbi.TagList) {
+		log.Print("Removing the corresponding DB snapshot...")
+
+		_, err := c.rdsc.RDS.DeleteDBSnapshot(ctx, &rds.DeleteDBSnapshotInput{
+			DBSnapshotIdentifier: dbs.DBSnapshotIdentifier,
+		})
+
+		if err != nil {
+			return fmt.Errorf("removing the corresponding DB snapshot: %w", err)
+		}
+
+		log.Print("The corresponding DB snapshot has been removed.")
+	}
+
 	return nil
 }
 
@@ -291,6 +370,36 @@ func (c *Cavalier) isCreatedByCavalier(ctx context.Context) (types.DBInstance, b
 	return dbi, true, nil
 }
 
+func isSnapshotCreatedByCavalier(dbi string, dbs types.DBSnapshot) bool {
+	for _, t := range dbs.TagList {
+		if aws.ToString(t.Key) != "CAVALIER_DB_INSTANCE_IDENTIFIER" {
+			continue
+		}
+
+		v := aws.ToString(t.Value)
+		if v == dbi {
+			return true
+		}
+	}
+
+	return false
+}
+
+func doesUseSnapshotCreatedByCavalier(tags []types.Tag) bool {
+	for _, t := range tags {
+		if aws.ToString(t.Key) != "USE_SNAPSHOT_CREATED_BY_CAVALIER" {
+			continue
+		}
+
+		v := aws.ToString(t.Value)
+		ok, _ := strconv.ParseBool(v)
+
+		return ok
+	}
+
+	return false
+}
+
 func isCreatedByCavalier(dbi types.DBInstance) bool {
 	for _, t := range dbi.TagList {
 		if aws.ToString(t.Key) != "CREATED_BY_CAVALIER" {
@@ -306,13 +415,83 @@ func isCreatedByCavalier(dbi types.DBInstance) bool {
 	return false
 }
 
+func dbSnapshotName(dbi string) string {
+	return fmt.Sprintf("%s-cavalier", dbi)
+}
+
+func (c *Cavalier) handleSnapshot(ctx context.Context) error {
+	log.Printf("Taking the DB snapshot of '%s'...", c.opts.SourceDBInstanceIdentifier)
+
+	_, err := c.rdsc.RDS.CreateDBSnapshot(ctx, &rds.CreateDBSnapshotInput{
+		DBInstanceIdentifier: aws.String(c.opts.SourceDBInstanceIdentifier),
+		DBSnapshotIdentifier: aws.String(dbSnapshotName(c.opts.DBInstanceIdentifier)),
+
+		Tags: []types.Tag{
+			{
+				Key:   aws.String("CAVALIER_DB_INSTANCE_IDENTIFIER"),
+				Value: aws.String(c.opts.DBInstanceIdentifier),
+			},
+		},
+	})
+
+	if err != nil {
+		return fmt.Errorf("creating the DB snapshot: %w", err)
+	}
+
+	log.Print("Waiting for the snapshot to be available...")
+
+	if err := c.checkWhetherDBSnapshotAvailable(
+		ctx,
+		c.opts.DBInstanceIdentifier,
+	); err != nil {
+		return err
+	}
+
+	log.Printf("The DB snapshot has been created.")
+
+	return nil
+}
+
 func (c *Cavalier) handleRestore(ctx context.Context) error {
-	log.Printf("Restoring a DB instance from '%s'...", c.opts.SnapshotARN)
+	snapshotARN := c.opts.SnapshotARN
+
+	if c.opts.takeSnapshot {
+		if err := c.handleSnapshot(ctx); err != nil {
+			return err
+		}
+
+		// get the corresponding snapshot ARN
+		dbs, err := c.rdsc.DescribeDBSnapshotByIdentifier(
+			ctx,
+			c.opts.DBInstanceIdentifier,
+		)
+		if err != nil {
+			return err
+		}
+
+		snapshotARN = aws.ToString(dbs.DBSnapshotArn)
+	}
+
+	tags := []types.Tag{
+		{
+			Key:   aws.String("CREATED_BY_CAVALIER"),
+			Value: aws.String("true"),
+		},
+	}
+
+	if c.opts.takeSnapshot {
+		tags = append(tags, types.Tag{
+			Key:   aws.String("USE_SNAPSHOT_CREATED_BY_CAVALIER"),
+			Value: aws.String("true"),
+		})
+	}
+
+	log.Printf("Restoring a DB instance from '%s'...", snapshotARN)
 
 	resp, err := c.rdsc.RDS.RestoreDBInstanceFromDBSnapshot(
 		ctx,
 		&rds.RestoreDBInstanceFromDBSnapshotInput{
-			DBSnapshotIdentifier: aws.String(c.opts.SnapshotARN),
+			DBSnapshotIdentifier: aws.String(snapshotARN),
 			DBSubnetGroupName:    aws.String(c.opts.DBSubnetGroupName),
 			VpcSecurityGroupIds:  c.opts.VPCSecurityGroupIDs,
 			DBInstanceClass:      aws.String(c.opts.DBInstanceClass),
@@ -326,12 +505,7 @@ func (c *Cavalier) handleRestore(ctx context.Context) error {
 			AutoMinorVersionUpgrade:         aws.Bool(false),
 			MultiAZ:                         aws.Bool(false),
 
-			Tags: []types.Tag{
-				{
-					Key:   aws.String("CREATED_BY_CAVALIER"),
-					Value: aws.String("true"),
-				},
-			},
+			Tags: tags,
 		},
 	)
 	if err != nil {
@@ -351,6 +525,22 @@ func (c *Cavalier) handleRestore(ctx context.Context) error {
 
 	if err := c.handleModify(ctx); err != nil {
 		return err
+	}
+
+	return nil
+}
+
+func (c *Cavalier) checkWhetherDBSnapshotAvailable(ctx context.Context, dbID string) error {
+	waiter := rds.NewDBSnapshotAvailableWaiter(c.rdsc.RDS, dbSnapshotAvailableWaiterOption)
+	if err := waiter.Wait(
+		ctx,
+		&rds.DescribeDBSnapshotsInput{
+			DBSnapshotIdentifier: aws.String(dbSnapshotName(dbID)),
+		},
+
+		30*time.Minute, // should be long enough
+	); err != nil {
+		return fmt.Errorf("waiting for the instance to be up and running: %w", err)
 	}
 
 	return nil
@@ -531,24 +721,20 @@ func masterUserPasswordSecretName(prefix, name string) string {
 	return fmt.Sprintf("%s/%s", prefix, name)
 }
 
+func dbSnapshotAvailableWaiterOption(opts *rds.DBSnapshotAvailableWaiterOptions) {
+	opts.MinDelay = 30 * time.Second
+	opts.MaxDelay = opts.MaxDelay
+
+	origRetryable := opts.Retryable
+	setCustomRDSRetryable(origRetryable, &opts.Retryable)
+}
+
 func dbInstanceAvailableWaiterOption(opts *rds.DBInstanceAvailableWaiterOptions) {
 	opts.MinDelay = 30 * time.Second
 	opts.MaxDelay = opts.MaxDelay
 
 	origRetryable := opts.Retryable
-	opts.Retryable = func(
-		ctx context.Context,
-		input *rds.DescribeDBInstancesInput,
-		output *rds.DescribeDBInstancesOutput,
-		err error,
-	) (bool, error) {
-		ok, err := waiterRetryable(ctx, input, output, err)
-		if !ok {
-			return false, err
-		}
-
-		return origRetryable(ctx, input, output, err)
-	}
+	setCustomRDSRetryable(origRetryable, &opts.Retryable)
 }
 
 func dbInstanceDeletedWaiterOption(opts *rds.DBInstanceDeletedWaiterOptions) {
@@ -556,27 +742,44 @@ func dbInstanceDeletedWaiterOption(opts *rds.DBInstanceDeletedWaiterOptions) {
 	opts.MaxDelay = opts.MaxDelay
 
 	origRetryable := opts.Retryable
-	opts.Retryable = func(
+	setCustomRDSRetryable(origRetryable, &opts.Retryable)
+}
+
+func setCustomRDSRetryable[In any, Out any](
+	origFn func(
+		context.Context,
+		*In,
+		*Out,
+		error,
+	) (bool, error),
+	fp *(func(
+		context.Context,
+		*In,
+		*Out,
+		error,
+	) (bool, error)),
+) {
+	*fp = func(
 		ctx context.Context,
-		input *rds.DescribeDBInstancesInput,
-		output *rds.DescribeDBInstancesOutput,
+		input *In,
+		output *Out,
 		err error,
 	) (bool, error) {
-		ok, err := waiterRetryable(ctx, input, output, err)
-		if !errors.Is(err, errSkipRetrable) {
+		ok, rerr := waiterRetryable(ctx, input, output, err)
+		if !errors.Is(rerr, errSkipRetrable) {
 			return ok, err
 		}
 
-		return origRetryable(ctx, input, output, err)
+		return origFn(ctx, input, output, err)
 	}
 }
 
 var errSkipRetrable = errors.New("cavalier: skip retryable")
 
-func waiterRetryable(
+func waiterRetryable[In any, Out any](
 	ctx context.Context,
-	_ *rds.DescribeDBInstancesInput,
-	_ *rds.DescribeDBInstancesOutput,
+	_ *In,
+	_ *Out,
 	err error,
 ) (bool, error) {
 	// return true if no decision will be made here
