@@ -248,8 +248,13 @@ type DBInstance struct {
 	MasterUserPassword string
 }
 
-func IsDBDeleted(err error) bool {
+func IsDBInstanceNotFound(err error) bool {
 	var notFoundErr *types.DBInstanceNotFoundFault
+	return errors.As(err, &notFoundErr)
+}
+
+func IsDBSnapshotNotFound(err error) bool {
+	var notFoundErr *types.DBSnapshotNotFoundFault
 	return errors.As(err, &notFoundErr)
 }
 
@@ -295,9 +300,9 @@ func (c *Cavalier) handleTerminate(ctx context.Context) error {
 	var dbAlreadyDeleted bool
 
 	// refuse to terminate if the instance wasn't created by the cavalier
-	dbi, ok, err := c.isCreatedByCavalier(ctx)
+	_, ok, err := c.isCreatedByCavalier(ctx)
 	if err != nil {
-		if IsDBDeleted(err) {
+		if IsDBInstanceNotFound(err) {
 			dbAlreadyDeleted = true
 		} else {
 			return err
@@ -328,10 +333,12 @@ func (c *Cavalier) handleTerminate(ctx context.Context) error {
 	// delete the corresponding snapshot if exists
 	dbs, err := c.rdsc.DescribeDBSnapshotByIdentifier(ctx, c.opts.DBInstanceIdentifier)
 	if err != nil {
-		return err
+		if !IsDBSnapshotNotFound(err) {
+			return err
+		}
 	}
 
-	if doesUseSnapshotCreatedByCavalier(dbi.TagList) {
+	if isSnapshotCreatedByCavalier(c.opts.DBInstanceIdentifier, dbs) {
 		log.Print("Removing the corresponding DB snapshot...")
 
 		_, err := c.rdsc.RDS.DeleteDBSnapshot(ctx, &rds.DeleteDBSnapshotInput{
@@ -343,6 +350,8 @@ func (c *Cavalier) handleTerminate(ctx context.Context) error {
 		}
 
 		log.Print("The corresponding DB snapshot has been removed.")
+	} else {
+		log.Print("There is no corresponding DB snapshot.")
 	}
 
 	return nil
@@ -380,21 +389,6 @@ func isSnapshotCreatedByCavalier(dbi string, dbs types.DBSnapshot) bool {
 		if v == dbi {
 			return true
 		}
-	}
-
-	return false
-}
-
-func doesUseSnapshotCreatedByCavalier(tags []types.Tag) bool {
-	for _, t := range tags {
-		if aws.ToString(t.Key) != "USE_SNAPSHOT_CREATED_BY_CAVALIER" {
-			continue
-		}
-
-		v := aws.ToString(t.Value)
-		ok, _ := strconv.ParseBool(v)
-
-		return ok
 	}
 
 	return false
@@ -661,7 +655,7 @@ func (c *Cavalier) handleModify(ctx context.Context) error {
 
 		mupw = existingPassword
 	} else {
-		log.Printf("A new master user password has been generated on %s", mupwARN)
+		log.Printf("A new master user password has been saved on %s", mupwARN)
 	}
 
 	log.Printf("Modifying for the DB instance of %s to for the testing...", dbID)
@@ -675,7 +669,7 @@ func (c *Cavalier) handleModify(ctx context.Context) error {
 		return fmt.Errorf("modifying the DB instance: %w", err)
 	}
 
-	time.Sleep(10 * time.Second)
+	time.Sleep(30 * time.Second)
 
 	if err := c.checkWhetherDBInstanceAvailable(
 		ctx,
