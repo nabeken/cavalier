@@ -2,31 +2,58 @@ package cavalier
 
 import (
 	"context"
+	"errors"
 	"testing"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/rds"
 	gomock "github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/require"
 )
 
 func TestHandleTerminate(t *testing.T) {
-	require := require.New(t)
+	ccfg := &Config{
+		DBInstanceIdentifier: "test",
+	}
 
-	ccfg := &Config{}
+	type testCase struct {
+		desc string
+		tf   func(t *testing.T, ctx context.Context, rdsc *MockRDSClient, smc *MockSecretsManagerClient)
+	}
 
-	cv := newTestCavalier(t, ccfg)
-	ctx := context.Background()
+	testCases := []testCase{
+		{
+			desc: "Error/DescribeDBInstances",
+			tf: func(t *testing.T, ctx context.Context, rdsc *MockRDSClient, smc *MockSecretsManagerClient) {
+				require := require.New(t)
 
-	actual := cv.HandleTerminate(ctx)
+				given := errors.New("describe db instances errors")
 
-	require.NoError(actual)
-}
+				rdsc.EXPECT().DescribeDBInstances(ctx, &rds.DescribeDBInstancesInput{
+					DBInstanceIdentifier: aws.String("test"),
+				}).Return(
+					nil, given,
+				)
 
-func newTestCavalier(t *testing.T, ccfg *Config) *Cavalier {
-	mc := gomock.NewController(t)
+				cv := New(ccfg, rdsc, smc)
 
-	return New(
-		ccfg,
-		NewMockRDSClient(mc),
-		NewMockSecretsManagerClient(mc),
-	)
+				actual := cv.HandleTerminate(ctx)
+
+				require.ErrorIs(actual, given)
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.desc, func(t *testing.T) {
+			mc := gomock.NewController(t)
+
+			tc.tf(
+				t,
+				context.Background(),
+				NewMockRDSClient(mc),
+				NewMockSecretsManagerClient(mc),
+			)
+		})
+	}
 }

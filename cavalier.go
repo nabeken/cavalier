@@ -154,7 +154,7 @@ func (c *Cavalier) HandleTerminate(ctx context.Context) error {
 	}
 
 	if !dbAlreadyDeleted && !ok {
-		return errors.New("the specified DB instance wasn't created by the cavalier")
+		return errDBNotCreatedByCavalier
 	}
 
 	if !dbAlreadyDeleted {
