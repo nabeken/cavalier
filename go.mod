@@ -8,6 +8,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/rds v1.19.0
 	github.com/aws/aws-sdk-go-v2/service/secretsmanager v1.15.6
 	github.com/aws/smithy-go v1.11.2
+	github.com/golang/mock v1.6.0
 	github.com/sethvargo/go-password v0.2.0
 	github.com/spf13/cobra v1.4.0
 )

@@ -1,4 +1,4 @@
-//go:generate mockgen -source=aws.go -destination=mock_aws.go
+//go:generate mockgen -package cavalier -source=aws.go -destination=mock_aws.go
 package cavalier
 
 import (
