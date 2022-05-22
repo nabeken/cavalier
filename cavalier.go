@@ -17,11 +17,17 @@ import (
 	"github.com/sethvargo/go-password/password"
 )
 
+const (
+	tagCreatedByCavalier            = "CREATED_BY_CAVALIER"
+	tagCavalierDBInstanceID         = "CAVALIER_DB_INSTANCE_IDENTIFIER"
+	tagUseSnapshotCreatedByCavalier = "USE_SNAPSHOT_CREATED_BY_CAVALIER"
+)
+
 type rdsClient struct {
 	RDS RDSClient
 }
 
-func (c *rdsClient) DescribeDBSnapshotByIdentifier(ctx context.Context, dbi string) (types.DBSnapshot, error) {
+func (c *rdsClient) DescribeCavalierDBSnapshotByIdentifier(ctx context.Context, dbi string) (types.DBSnapshot, error) {
 	var zero types.DBSnapshot
 
 	p := rds.NewDescribeDBSnapshotsPaginator(c.RDS, &rds.DescribeDBSnapshotsInput{
@@ -42,7 +48,7 @@ func (c *rdsClient) DescribeDBSnapshotByIdentifier(ctx context.Context, dbi stri
 		}
 	}
 
-	return zero, errors.New("no corresponding the DB snapshot")
+	return zero, errNoSnapshot
 }
 
 type Config struct {
@@ -109,12 +115,6 @@ func (c *Cavalier) deleteDBInstance(ctx context.Context, dbInstanceIdentifier st
 		SkipFinalSnapshot:      true,
 	})
 
-	var notFoundErr *types.DBInstanceNotFoundFault
-	if errors.As(err, &notFoundErr) {
-		log.Printf("The DB instance is already deleted.")
-		return nil
-	}
-
 	var invalidStateErr *types.InvalidDBInstanceStateFault
 	if err != nil && !errors.As(err, &invalidStateErr) {
 		return fmt.Errorf("deleting the DB instance: %w", err)
@@ -140,6 +140,7 @@ func (c *Cavalier) deleteDBInstance(ctx context.Context, dbInstanceIdentifier st
 	return nil
 }
 
+// HandleTerminate removes the DB instance, the associated secrets and the snapshot taken by Cavalier.
 func (c *Cavalier) HandleTerminate(ctx context.Context) error {
 	var dbAlreadyDeleted bool
 
@@ -175,28 +176,27 @@ func (c *Cavalier) HandleTerminate(ctx context.Context) error {
 	log.Print("The master user password for the DB instance has been deleted.")
 
 	// delete the corresponding snapshot if exists
-	dbs, err := c.rdsc.DescribeDBSnapshotByIdentifier(ctx, c.cfg.DBInstanceIdentifier)
+	dbs, err := c.rdsc.DescribeCavalierDBSnapshotByIdentifier(ctx, c.cfg.DBInstanceIdentifier)
 	if err != nil {
-		if !IsDBSnapshotNotFound(err) {
-			return err
-		}
-	}
-
-	if isSnapshotCreatedByCavalier(c.cfg.DBInstanceIdentifier, dbs) {
-		log.Print("Removing the corresponding DB snapshot...")
-
-		_, err := c.rdsc.RDS.DeleteDBSnapshot(ctx, &rds.DeleteDBSnapshotInput{
-			DBSnapshotIdentifier: dbs.DBSnapshotIdentifier,
-		})
-
-		if err != nil {
-			return fmt.Errorf("removing the corresponding DB snapshot: %w", err)
+		if IsDBSnapshotNotFound(err) || errors.Is(err, errNoSnapshot) {
+			log.Print("There is no corresponding DB snapshot.")
+			return nil
 		}
 
-		log.Print("The corresponding DB snapshot has been removed.")
-	} else {
-		log.Print("There is no corresponding DB snapshot.")
+		return err
 	}
+
+	log.Print("Removing the corresponding DB snapshot...")
+
+	_, err = c.rdsc.RDS.DeleteDBSnapshot(ctx, &rds.DeleteDBSnapshotInput{
+		DBSnapshotIdentifier: dbs.DBSnapshotIdentifier,
+	})
+
+	if err != nil {
+		return fmt.Errorf("removing the corresponding DB snapshot: %w", err)
+	}
+
+	log.Print("The corresponding DB snapshot has been removed.")
 
 	return nil
 }
@@ -225,7 +225,7 @@ func (c *Cavalier) isCreatedByCavalier(ctx context.Context) (types.DBInstance, b
 
 func isSnapshotCreatedByCavalier(dbi string, dbs types.DBSnapshot) bool {
 	for _, t := range dbs.TagList {
-		if aws.ToString(t.Key) != "CAVALIER_DB_INSTANCE_IDENTIFIER" {
+		if aws.ToString(t.Key) != tagCavalierDBInstanceID {
 			continue
 		}
 
@@ -266,7 +266,7 @@ func (c *Cavalier) HandleSnapshot(ctx context.Context) error {
 
 		Tags: []types.Tag{
 			{
-				Key:   aws.String("CAVALIER_DB_INSTANCE_IDENTIFIER"),
+				Key:   aws.String(tagCavalierDBInstanceID),
 				Value: aws.String(c.cfg.DBInstanceIdentifier),
 			},
 		},
@@ -299,7 +299,7 @@ func (c *Cavalier) HandleRestore(ctx context.Context) error {
 		}
 
 		// get the corresponding snapshot ARN
-		dbs, err := c.rdsc.DescribeDBSnapshotByIdentifier(
+		dbs, err := c.rdsc.DescribeCavalierDBSnapshotByIdentifier(
 			ctx,
 			c.cfg.DBInstanceIdentifier,
 		)
@@ -312,14 +312,14 @@ func (c *Cavalier) HandleRestore(ctx context.Context) error {
 
 	tags := []types.Tag{
 		{
-			Key:   aws.String("CREATED_BY_CAVALIER"),
+			Key:   aws.String(tagCreatedByCavalier),
 			Value: aws.String("true"),
 		},
 	}
 
 	if c.cfg.takeSnapshot {
 		tags = append(tags, types.Tag{
-			Key:   aws.String("USE_SNAPSHOT_CREATED_BY_CAVALIER"),
+			Key:   aws.String(tagUseSnapshotCreatedByCavalier),
 			Value: aws.String("true"),
 		})
 	}
